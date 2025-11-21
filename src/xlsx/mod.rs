@@ -13,15 +13,16 @@ use std::io::{Read, Seek};
 use std::str::FromStr;
 
 use log::warn;
-use quick_xml::Reader as XmlReader;
-use quick_xml::events::Event;
 use quick_xml::events::attributes::{Attribute, Attributes};
+use quick_xml::events::Event;
 use quick_xml::name::QName;
+use quick_xml::Reader as XmlReader;
 use zip::read::{ZipArchive, ZipFile};
 use zip::result::ZipError;
 
 use crate::datatype::DataRef;
-use crate::formats::{CellFormat, builtin_format_by_id, detect_custom_number_format};
+use crate::formats::{builtin_format_by_id, detect_custom_number_format, CellFormat};
+use crate::utils::{unescape_entity_to_buffer, unescape_xml};
 use crate::vba::VbaProject;
 use crate::{
     Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, ReaderRef, Sheet,
@@ -59,7 +60,7 @@ pub enum XlsxError {
     Xml(quick_xml::Error),
 
     /// A wrapper for a variety of [`quick_xml::events::attributes::AttrError`]
-    /// errors related to missing attributes in XML elements.
+    /// errors related to attributes in XML elements.
     XmlAttr(quick_xml::events::attributes::AttrError),
 
     /// A wrapper for a variety of [`std::string::ParseError`] errors when
@@ -98,6 +99,12 @@ pub enum XlsxError {
     /// Missing row number when parsing an `A1` style range string.
     RangeWithoutRowComponent,
 
+    /// Column number exceeds maximum allowed columns.
+    ColumnNumberOverflow,
+
+    /// Row number exceeds maximum allowed rows.
+    RowNumberOverflow,
+
     /// Error when parsing dimensions of a worksheet.
     DimensionCount(usize),
 
@@ -134,25 +141,16 @@ pub enum XlsxError {
     /// A wrapper for a variety of [`quick_xml::encoding::EncodingError`]
     /// encoding errors.
     Encoding(quick_xml::encoding::EncodingError),
-
-    /// A wrapper for a variety of [`quick_xml::events::attributes::AttrError`]
-    /// errors related to XML attributes.
-    XmlAttribute(quick_xml::events::attributes::AttrError),
 }
 
 from_err!(std::io::Error, XlsxError, Io);
 from_err!(zip::result::ZipError, XlsxError, Zip);
 from_err!(crate::vba::VbaError, XlsxError, Vba);
 from_err!(quick_xml::Error, XlsxError, Xml);
-from_err!(std::string::ParseError, XlsxError, Parse);
 from_err!(std::num::ParseFloatError, XlsxError, ParseFloat);
 from_err!(std::num::ParseIntError, XlsxError, ParseInt);
 from_err!(quick_xml::encoding::EncodingError, XlsxError, Encoding);
-from_err!(
-    quick_xml::events::attributes::AttrError,
-    XlsxError,
-    XmlAttribute
-);
+from_err!(quick_xml::events::attributes::AttrError, XlsxError, XmlAttr);
 
 impl std::fmt::Display for XlsxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -187,6 +185,8 @@ impl std::fmt::Display for XlsxError {
             XlsxError::RangeWithoutRowComponent => {
                 write!(f, "Range is missing the expected row component.")
             }
+            XlsxError::ColumnNumberOverflow => write!(f, "column number overflow"),
+            XlsxError::RowNumberOverflow => write!(f, "row number overflow"),
             XlsxError::Unexpected(e) => write!(f, "{e}"),
             XlsxError::Unrecognized { typ, val } => write!(f, "Unrecognized {typ}: {val}"),
             XlsxError::CellError(e) => write!(f, "Unsupported cell error value '{e}'"),
@@ -195,7 +195,6 @@ impl std::fmt::Display for XlsxError {
             XlsxError::TableNotFound(n) => write!(f, "Table '{n}' not found"),
             XlsxError::NotAWorksheet(typ) => write!(f, "Expecting a worksheet, got {typ}"),
             XlsxError::Encoding(e) => write!(f, "XML encoding error: {e}"),
-            XlsxError::XmlAttribute(e) => write!(f, "XML attribute error: {e}"),
         }
     }
 }
@@ -211,7 +210,6 @@ impl std::error::Error for XlsxError {
             XlsxError::ParseInt(e) => Some(e),
             XlsxError::ParseFloat(e) => Some(e),
             XlsxError::Encoding(e) => Some(e),
-            XlsxError::XmlAttribute(e) => Some(e),
             _ => None,
         }
     }
@@ -277,12 +275,12 @@ impl<RS: Read + Seek> Xlsx<RS> {
         loop {
             buf.clear();
             match xml.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"si" => {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"si" => {
                     if let Some(s) = read_string(&mut xml, e.name())? {
                         self.strings.push(s);
                     }
                 }
-                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"sst" => break,
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"sst" => break,
                 Ok(Event::Eof) => return Err(XlsxError::XmlEof("sst")),
                 Err(e) => return Err(XlsxError::Xml(e)),
                 _ => (),
@@ -304,14 +302,14 @@ impl<RS: Read + Seek> Xlsx<RS> {
         loop {
             buf.clear();
             match xml.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"numFmts" => loop {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"numFmts" => loop {
                     inner_buf.clear();
                     match xml.read_event_into(&mut inner_buf) {
-                        Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"numFmt" => {
+                        Ok(Event::Start(e)) if e.local_name().as_ref() == b"numFmt" => {
                             let mut id = Vec::new();
                             let mut format = String::new();
                             for a in e.attributes() {
-                                match a.map_err(XlsxError::XmlAttr)? {
+                                match a? {
                                     Attribute {
                                         key: QName(b"numFmtId"),
                                         value: v,
@@ -327,16 +325,16 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                 number_formats.insert(id, format);
                             }
                         }
-                        Ok(Event::End(ref e)) if e.local_name().as_ref() == b"numFmts" => break,
+                        Ok(Event::End(e)) if e.local_name().as_ref() == b"numFmts" => break,
                         Ok(Event::Eof) => return Err(XlsxError::XmlEof("numFmts")),
                         Err(e) => return Err(XlsxError::Xml(e)),
                         _ => (),
                     }
                 },
-                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"cellXfs" => loop {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"cellXfs" => loop {
                     inner_buf.clear();
                     match xml.read_event_into(&mut inner_buf) {
-                        Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"xf" => {
+                        Ok(Event::Start(e)) if e.local_name().as_ref() == b"xf" => {
                             self.formats.push(
                                 e.attributes()
                                     .filter_map(|a| a.ok())
@@ -349,13 +347,13 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                     }),
                             );
                         }
-                        Ok(Event::End(ref e)) if e.local_name().as_ref() == b"cellXfs" => break,
+                        Ok(Event::End(e)) if e.local_name().as_ref() == b"cellXfs" => break,
                         Ok(Event::Eof) => return Err(XlsxError::XmlEof("cellXfs")),
                         Err(e) => return Err(XlsxError::Xml(e)),
                         _ => (),
                     }
                 },
-                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"styleSheet" => break,
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"styleSheet" => break,
                 Ok(Event::Eof) => return Err(XlsxError::XmlEof("styleSheet")),
                 Err(e) => return Err(XlsxError::Xml(e)),
                 _ => (),
@@ -378,12 +376,12 @@ impl<RS: Read + Seek> Xlsx<RS> {
         loop {
             buf.clear();
             match xml.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"sheet" => {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"sheet" => {
                     let mut name = String::new();
                     let mut path = String::new();
                     let mut visible = SheetVisible::Visible;
                     for a in e.attributes() {
-                        let a = a.map_err(XlsxError::XmlAttr)?;
+                        let a = a?;
                         match a {
                             Attribute {
                                 key: QName(b"name"),
@@ -404,16 +402,12 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                         return Err(XlsxError::Unrecognized {
                                             typ: "sheet:state",
                                             val: v.to_string(),
-                                        });
+                                        })
                                     }
                                 }
                             }
                             Attribute {
-                                key: QName(b"r:id"),
-                                value: v,
-                            }
-                            | Attribute {
-                                key: QName(b"relationships:id"),
+                                key: QName(b"r:id" | b"relationships:id"),
                                 value: v,
                             } => {
                                 let r = &relationships
@@ -440,7 +434,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                             return Err(XlsxError::Unrecognized {
                                 typ: "sheet:type",
                                 val: path.to_string(),
-                            });
+                            })
                         }
                     };
                     self.metadata.sheets.push(Sheet {
@@ -450,7 +444,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     });
                     self.sheets.push((name, path));
                 }
-                Ok(Event::Start(ref e)) if e.name().as_ref() == b"workbookPr" => {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"workbookPr" => {
                     self.is_1904 = match e.try_get_attribute("date1904")? {
                         Some(c) => ["1", "true"].contains(
                             &c.decode_and_unescape_value(xml.decoder())
@@ -460,7 +454,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                         None => false,
                     };
                 }
-                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"definedName" => {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"definedName" => {
                     if let Some(a) = e
                         .attributes()
                         .filter_map(std::result::Result::ok)
@@ -471,7 +465,8 @@ impl<RS: Read + Seek> Xlsx<RS> {
                         let mut value = String::new();
                         loop {
                             match xml.read_event_into(&mut val_buf)? {
-                                Event::Text(t) => value.push_str(&t.unescape()?),
+                                Event::Text(t) => value.push_str(&t.xml10_content()?),
+                                Event::GeneralRef(e) => unescape_entity_to_buffer(&e, &mut value)?,
                                 Event::End(end) if end.name() == e.name() => break,
                                 Event::Eof => return Err(XlsxError::XmlEof("workbook")),
                                 _ => (),
@@ -480,7 +475,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                         defined_names.push((name, value));
                     }
                 }
-                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"workbook" => break,
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"workbook" => break,
                 Ok(Event::Eof) => return Err(XlsxError::XmlEof("workbook")),
                 Err(e) => return Err(XlsxError::Xml(e)),
                 _ => (),
@@ -504,11 +499,11 @@ impl<RS: Read + Seek> Xlsx<RS> {
         loop {
             buf.clear();
             match xml.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"Relationship" => {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == b"Relationship" => {
                     let mut id = Vec::new();
                     let mut target = String::new();
                     for a in e.attributes() {
-                        match a.map_err(XlsxError::XmlAttr)? {
+                        match a? {
                             Attribute {
                                 key: QName(b"Id"),
                                 value: v,
@@ -522,7 +517,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     }
                     relationships.insert(id, target);
                 }
-                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"Relationships" => break,
+                Ok(Event::End(e)) if e.local_name().as_ref() == b"Relationships" => break,
                 Ok(Event::Eof) => return Err(XlsxError::XmlEof("Relationships")),
                 Err(e) => return Err(XlsxError::Xml(e)),
                 _ => (),
@@ -550,12 +545,12 @@ impl<RS: Read + Seek> Xlsx<RS> {
                 loop {
                     buf.clear();
                     match xml.read_event_into(&mut buf) {
-                        Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"Relationship" => {
+                        Ok(Event::Start(e)) if e.local_name().as_ref() == b"Relationship" => {
                             let mut id = Vec::new();
                             let mut target = String::new();
                             let mut table_type = false;
                             for a in e.attributes() {
-                                match a.map_err(XlsxError::XmlAttr)? {
+                                match a? {
                                     Attribute {
                                         key: QName(b"Id"),
                                         value: v,
@@ -585,9 +580,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                 }
                             }
                         }
-                        Ok(Event::End(ref e)) if e.local_name().as_ref() == b"Relationships" => {
-                            break;
-                        }
+                        Ok(Event::End(e)) if e.local_name().as_ref() == b"Relationships" => break,
                         Ok(Event::Eof) => return Err(XlsxError::XmlEof("Relationships")),
                         Err(e) => return Err(XlsxError::Xml(e)),
                         _ => (),
@@ -604,9 +597,9 @@ impl<RS: Read + Seek> Xlsx<RS> {
                 loop {
                     buf.clear();
                     match xml.read_event_into(&mut buf) {
-                        Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"table" => {
+                        Ok(Event::Start(e)) if e.local_name().as_ref() == b"table" => {
                             for a in e.attributes() {
-                                match a.map_err(XlsxError::XmlAttr)? {
+                                match a? {
                                     Attribute {
                                         key: QName(b"displayName"),
                                         value: v,
@@ -643,7 +636,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                 }
                             }
                         }
-                        Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tableColumn" => {
+                        Ok(Event::Start(e)) if e.local_name().as_ref() == b"tableColumn" => {
                             for a in e.attributes().flatten() {
                                 if let Attribute {
                                     key: QName(b"name"),
@@ -654,7 +647,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                 }
                             }
                         }
-                        Ok(Event::End(ref e)) if e.local_name().as_ref() == b"table" => break,
+                        Ok(Event::End(e)) if e.local_name().as_ref() == b"table" => break,
                         Ok(Event::Eof) => return Err(XlsxError::XmlEof("Table")),
                         Err(e) => return Err(XlsxError::Xml(e)),
                         _ => (),
@@ -682,7 +675,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
         Ok(())
     }
 
-    /// Read pictures
+    // Read pictures.
     #[cfg(feature = "picture")]
     fn read_pictures(&mut self) -> Result<(), XlsxError> {
         let mut pics = Vec::new();
@@ -725,7 +718,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                 loop {
                     buf.clear();
                     match xml.read_event_into(&mut buf) {
-                        Ok(Event::Start(ref e)) if e.local_name() == QName(b"mergeCell").into() => {
+                        Ok(Event::Start(e)) if e.local_name() == QName(b"mergeCell").into() => {
                             if let Some(attr) = get_attribute(e.attributes(), QName(b"ref"))? {
                                 let dimension = get_dimension(attr)?;
                                 regions.push((
@@ -1507,14 +1500,13 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
         self
     }
 
-    fn vba_project(&mut self) -> Option<Result<Cow<'_, VbaProject>, XlsxError>> {
-        let mut f = self.zip.by_name("xl/vbaProject.bin").ok()?;
+    fn vba_project(&mut self) -> Result<Option<VbaProject>, XlsxError> {
+        let Some(mut f) = self.zip.by_name("xl/vbaProject.bin").ok() else {
+            return Ok(None);
+        };
         let len = f.size() as usize;
-        Some(
-            VbaProject::new(&mut f, len)
-                .map(Cow::Owned)
-                .map_err(XlsxError::Vba),
-        )
+        let vba = VbaProject::new(&mut f, len)?;
+        Ok(Some(vba))
     }
 
     fn metadata(&self) -> &Metadata {
@@ -1795,33 +1787,40 @@ where
     loop {
         buf.clear();
         match xml.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"r" => {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"r" => {
                 if rich_buffer.is_none() {
                     // use a buffer since richtext has multiples <r> and <t> for the same cell
                     rich_buffer = Some(String::new());
                 }
             }
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rPh" => {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"rPh" => {
                 is_phonetic_text = true;
             }
-            Ok(Event::End(ref e)) if e.name() == closing => {
+            Ok(Event::End(e)) if e.name() == closing => {
+                if rich_buffer.is_none() {
+                    // An empty <s></s> element, without <t> or other
+                    // subelements, is treated as a valid empty string in Excel.
+                    rich_buffer = Some(String::new());
+                }
+
                 return Ok(rich_buffer);
             }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"rPh" => {
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"rPh" => {
                 is_phonetic_text = false;
             }
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"t" && !is_phonetic_text => {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"t" && !is_phonetic_text => {
                 val_buf.clear();
                 let mut value = String::new();
                 loop {
                     match xml.read_event_into(&mut val_buf)? {
-                        Event::Text(t) => value.push_str(&t.unescape()?),
+                        Event::Text(t) => value.push_str(&unescape_xml(&t.xml10_content()?)),
+                        Event::GeneralRef(e) => unescape_entity_to_buffer(&e, &mut value)?,
                         Event::End(end) if end.name() == e.name() => break,
                         Event::Eof => return Err(XlsxError::XmlEof("t")),
                         _ => (),
                     }
                 }
-                if let Some(ref mut s) = rich_buffer {
+                if let Some(s) = &mut rich_buffer {
                     s.push_str(&value);
                 } else {
                     // consume any remaining events up to expected closing tag
@@ -1861,7 +1860,7 @@ where
         match xml.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) if event.local_name().as_ref() == b"mergeCell" => {
                 for attribute in event.attributes() {
-                    let attribute = attribute.map_err(XlsxError::XmlAttr)?;
+                    let attribute = attribute?;
 
                     if attribute.key == QName(b"ref") {
                         let dimensions = get_dimension(&attribute.value)?;
@@ -1883,58 +1882,285 @@ where
     Ok(merge_cells)
 }
 
-/// advance the cell name by the offset
-fn offset_cell_name(name: &[char], offset: (i64, i64)) -> Result<Vec<u8>, XlsxError> {
-    let cell = get_row_column(name.iter().map(|c| *c as u8).collect::<Vec<_>>().as_slice())?;
-    coordinate_to_name((
-        (cell.0 as i64 + offset.0) as u32,
-        (cell.1 as i64 + offset.1) as u32,
-    ))
+#[derive(Debug, Copy, Clone)]
+enum Reference {
+    Cell {
+        row: u32,
+        col: u32,
+        absolute_row: bool,
+        absolute_col: bool,
+    },
+    Row {
+        row: u32,
+        absolute: bool,
+    },
+    Column {
+        col: u32,
+        absolute: bool,
+    },
 }
 
-/// advance all valid cell names in the string by the offset
+impl Reference {
+    // Create a cell reference with validation.
+    fn cell(row: u32, col: u32, absolute_row: bool, absolute_col: bool) -> Result<Self, XlsxError> {
+        let reference = Reference::Cell {
+            row,
+            col,
+            absolute_row,
+            absolute_col,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    // Create a column reference with validation.
+    fn column(col: u32, absolute: bool) -> Result<Self, XlsxError> {
+        let reference = Reference::Column { col, absolute };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    // Create a row reference with validation.
+    fn row(row: u32, absolute: bool) -> Result<Self, XlsxError> {
+        let reference = Reference::Row { row, absolute };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    // Parse a reference (e.g., "A1", "$A1", "A$1", "$A$1", "E", "$E", "5", "$5").
+    fn parse(name: &[u8]) -> Result<Self, XlsxError> {
+        let mut iter = name.iter().peekable();
+        let mut col: u32 = 0;
+        let mut row: u32 = 0;
+        let mut absolute_col = false;
+        let mut absolute_row = false;
+
+        while let Some(&c) = iter.next() {
+            match (c, iter.peek()) {
+                (b'$', Some(b'A'..=b'Z' | b'a'..=b'z')) => {
+                    if row > 0 || col > 0 {
+                        return Err(XlsxError::Alphanumeric(c));
+                    }
+                    absolute_col = true;
+                }
+                (b'$', Some(b'0'..=b'9')) => {
+                    if row > 0 {
+                        return Err(XlsxError::Alphanumeric(c));
+                    }
+                    absolute_row = true;
+                }
+                (b'$', _) => return Err(XlsxError::Alphanumeric(c)),
+                (c @ (b'A'..=b'Z' | b'a'..=b'z'), _) => {
+                    if row > 0 {
+                        return Err(XlsxError::Alphanumeric(c));
+                    }
+                    col = col
+                        .wrapping_mul(26)
+                        .wrapping_add((c.to_ascii_uppercase() - b'A') as u32 + 1);
+                }
+                (c @ b'0'..=b'9', _) => {
+                    row = row.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+                }
+                _ => return Err(XlsxError::Alphanumeric(c)),
+            }
+        }
+
+        match (col.checked_sub(1), row.checked_sub(1)) {
+            (Some(col), Some(row)) => Reference::cell(row, col, absolute_row, absolute_col),
+            (Some(col), None) => Reference::column(col, absolute_col),
+            (None, Some(row)) => Reference::row(row, absolute_row),
+            (None, None) => Err(XlsxError::Unexpected("Empty reference")),
+        }
+    }
+
+    // Apply offset to create a new reference with validation.
+    fn offset(self, offset: (i64, i64)) -> Result<Self, XlsxError> {
+        let result = match self {
+            Reference::Cell {
+                row,
+                col,
+                absolute_row,
+                absolute_col,
+            } => {
+                let new_col = if absolute_col {
+                    col
+                } else {
+                    (col as i64 + offset.1) as u32
+                };
+                let new_row = if absolute_row {
+                    row
+                } else {
+                    (row as i64 + offset.0) as u32
+                };
+
+                Reference::Cell {
+                    row: new_row,
+                    col: new_col,
+                    absolute_row,
+                    absolute_col,
+                }
+            }
+            Reference::Column { col, absolute } => {
+                let new_col = if absolute {
+                    col
+                } else {
+                    (col as i64 + offset.1) as u32
+                };
+
+                Reference::Column {
+                    col: new_col,
+                    absolute,
+                }
+            }
+            Reference::Row { row, absolute } => {
+                let new_row = if absolute {
+                    row
+                } else {
+                    (row as i64 + offset.0) as u32
+                };
+
+                Reference::Row {
+                    row: new_row,
+                    absolute,
+                }
+            }
+        };
+
+        result.validate()?;
+        Ok(result)
+    }
+
+    // Validate that row/column values are in bounds.
+    fn validate(&self) -> Result<(), XlsxError> {
+        match self {
+            Reference::Cell { row, col, .. } => {
+                if *col >= MAX_COLUMNS {
+                    return Err(XlsxError::ColumnNumberOverflow);
+                }
+                if *row >= MAX_ROWS {
+                    return Err(XlsxError::RowNumberOverflow);
+                }
+                Ok(())
+            }
+            Reference::Column { col, .. } => {
+                if *col >= MAX_COLUMNS {
+                    return Err(XlsxError::ColumnNumberOverflow);
+                }
+                Ok(())
+            }
+            Reference::Row { row, .. } => {
+                if *row >= MAX_ROWS {
+                    return Err(XlsxError::RowNumberOverflow);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // Format a reference to bytes.
+    fn format(&self, buf: &mut Vec<u8>) -> Result<(), XlsxError> {
+        match self {
+            Reference::Cell {
+                row,
+                col,
+                absolute_row,
+                absolute_col,
+            } => {
+                if *absolute_col {
+                    buf.push(b'$');
+                }
+                column_number_to_name(*col, buf)?;
+                if *absolute_row {
+                    buf.push(b'$');
+                }
+                buf.extend((row + 1).to_string().into_bytes());
+                Ok(())
+            }
+            Reference::Column { col, absolute } => {
+                if *absolute {
+                    buf.push(b'$');
+                }
+                column_number_to_name(*col, buf)
+            }
+            Reference::Row { row, absolute } => {
+                if *absolute {
+                    buf.push(b'$');
+                }
+                buf.extend((row + 1).to_string().into_bytes());
+                Ok(())
+            }
+        }
+    }
+}
+
+// Advance a reference by the offset (e.g., "A1", "E:F", "5:6", "A1:B5").
+fn offset_range(range: &[u8], offset: (i64, i64), buf: &mut Vec<u8>) -> Result<(), XlsxError> {
+    let colon_pos = range.iter().position(|&b| b == b':');
+
+    match colon_pos {
+        None => {
+            let reference = Reference::parse(range)?;
+            if !matches!(reference, Reference::Cell { .. }) {
+                return Err(XlsxError::Unexpected("Single reference type must be cell"));
+            }
+            let offset_ref = reference.offset(offset)?;
+            offset_ref.format(buf)
+        }
+        Some(idx) => {
+            let start = &range[..idx];
+            let end = &range[idx + 1..];
+
+            let start_ref = Reference::parse(start)?;
+            let end_ref = Reference::parse(end)?;
+
+            if std::mem::discriminant(&start_ref) != std::mem::discriminant(&end_ref) {
+                return Err(XlsxError::Unexpected("Range type mismatch"));
+            }
+
+            let start_offset = start_ref.offset(offset)?;
+            let end_offset = end_ref.offset(offset)?;
+
+            start_offset.format(buf)?;
+            buf.push(b':');
+            end_offset.format(buf)
+        }
+    }
+}
+
+// Advance all valid cell names in the string by the offset.
 fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, XlsxError> {
+    let bytes = s.as_bytes();
     let mut res: Vec<u8> = Vec::new();
-    let mut cell: Vec<char> = Vec::new();
-    let mut is_cell_row = false;
     let mut in_quote = false;
-    for c in s.chars() {
-        if c == '"' {
-            in_quote = !in_quote;
-        }
-        if in_quote {
-            res.push(c as u8);
-            continue;
-        }
-        if c.is_ascii_alphabetic() {
-            if is_cell_row {
-                // two cell not possible stick together in formula
-                res.extend(cell.iter().map(|c| *c as u8));
-                cell.clear();
-                is_cell_row = false;
-            }
-            cell.push(c);
-        } else if c.is_ascii_digit() {
-            is_cell_row = true;
-            cell.push(c);
+
+    let mut token_start = 0;
+    let mut token_end = 0;
+
+    for (i, &c) in bytes.iter().enumerate() {
+        if !in_quote && (c.is_ascii_alphanumeric() || c == b'$' || c == b':') {
+            token_end = i + 1;
         } else {
-            if let Ok(cell_name) = offset_cell_name(cell.as_ref(), offset) {
-                res.extend(cell_name);
-            } else {
-                res.extend(cell.iter().map(|c| *c as u8));
+            if token_start < token_end
+                && offset_range(&bytes[token_start..token_end], offset, &mut res).is_err()
+            {
+                res.extend(&bytes[token_start..token_end]);
             }
-            cell.clear();
-            is_cell_row = false;
-            res.push(c as u8);
+            res.push(c);
+            token_start = i + 1;
+            token_end = i + 1;
+
+            if c == b'"' {
+                in_quote = !in_quote;
+            }
         }
     }
-    if !cell.is_empty() {
-        if let Ok(cell_name) = offset_cell_name(cell.as_ref(), offset) {
-            res.extend(cell_name);
-        } else {
-            res.extend(cell.iter().map(|c| *c as u8));
-        }
+
+    if token_start < token_end
+        && offset_range(&bytes[token_start..token_end], offset, &mut res).is_err()
+    {
+        res.extend(&bytes[token_start..token_end]);
     }
+
     match String::from_utf8(res) {
         Ok(s) => Ok(s),
         Err(_) => Err(XlsxError::Unexpected("fail to convert cell name")),
@@ -1943,29 +2169,19 @@ fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, XlsxError> 
 
 /// Convert the integer to Excelsheet column title.
 /// If the column number not in 1~16384, an Error is returned.
-pub(crate) fn column_number_to_name(num: u32) -> Result<Vec<u8>, XlsxError> {
+pub(crate) fn column_number_to_name(num: u32, buf: &mut Vec<u8>) -> Result<(), XlsxError> {
     if num >= MAX_COLUMNS {
-        return Err(XlsxError::Unexpected("column number overflow"));
+        return Err(XlsxError::ColumnNumberOverflow);
     }
-    let mut col: Vec<u8> = Vec::new();
+    let start = buf.len();
     let mut num = num + 1;
     while num > 0 {
         let integer = ((num - 1) % 26 + 65) as u8;
-        col.push(integer);
+        buf.push(integer);
         num = (num - 1) / 26;
     }
-    col.reverse();
-    Ok(col)
-}
-
-/// Convert a cell coordinate to Excelsheet cell name.
-/// If the column number not in 1~16384, an Error is returned.
-pub(crate) fn coordinate_to_name(cell: (u32, u32)) -> Result<Vec<u8>, XlsxError> {
-    let cell = &[
-        column_number_to_name(cell.1)?,
-        (cell.0 + 1).to_string().into_bytes(),
-    ];
-    Ok(cell.concat())
+    buf[start..].reverse();
+    Ok(())
 }
 
 // Convert an Excel Open Packaging "Part" path like "xl/sharedStrings.xml" to
@@ -1990,8 +2206,8 @@ pub(crate) fn path_to_zip_path<RS: Read + Seek>(zip: &ZipArchive<RS>, path: &str
 mod tests {
     use super::*;
     use std::io::Write;
-    use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
 
     #[test]
     fn test_dimensions() {
@@ -2053,20 +2269,299 @@ mod tests {
 
     #[test]
     fn test_column_number_to_name() {
-        assert_eq!(column_number_to_name(0).unwrap(), b"A");
-        assert_eq!(column_number_to_name(25).unwrap(), b"Z");
-        assert_eq!(column_number_to_name(26).unwrap(), b"AA");
-        assert_eq!(column_number_to_name(27).unwrap(), b"AB");
-        assert_eq!(column_number_to_name(MAX_COLUMNS - 1).unwrap(), b"XFD");
+        let check = |num, expected: &[u8]| {
+            let mut buf = Vec::new();
+            column_number_to_name(num, &mut buf).unwrap();
+            assert_eq!(buf, expected);
+        };
+
+        check(0, b"A");
+        check(25, b"Z");
+        check(26, b"AA");
+        check(27, b"AB");
+        check(MAX_COLUMNS - 1, b"XFD");
     }
 
     #[test]
-    fn test_coordinate_to_name() {
-        assert_eq!(coordinate_to_name((0, 0)).unwrap(), b"A1");
-        assert_eq!(
-            coordinate_to_name((MAX_ROWS - 1, MAX_COLUMNS - 1)).unwrap(),
-            b"XFD1048576"
+    fn test_parse_reference() {
+        let check_cell =
+            |input: &[u8], row, col, abs_row, abs_col| match Reference::parse(input).unwrap() {
+                Reference::Cell {
+                    row: r,
+                    col: c,
+                    absolute_row: ar,
+                    absolute_col: ac,
+                } => {
+                    assert_eq!((r, c, ar, ac), (row, col, abs_row, abs_col));
+                }
+                _ => panic!("Expected Cell reference"),
+            };
+
+        let check_column = |input: &[u8], col, abs| match Reference::parse(input).unwrap() {
+            Reference::Column {
+                col: c,
+                absolute: a,
+            } => {
+                assert_eq!((c, a), (col, abs));
+            }
+            _ => panic!("Expected Column reference"),
+        };
+
+        let check_row = |input: &[u8], row, abs| match Reference::parse(input).unwrap() {
+            Reference::Row {
+                row: r,
+                absolute: a,
+            } => {
+                assert_eq!((r, a), (row, abs));
+            }
+            _ => panic!("Expected Row reference"),
+        };
+
+        // Cell references
+        check_cell(b"A1", 0, 0, false, false);
+        check_cell(b"$A1", 0, 0, false, true);
+        check_cell(b"A$1", 0, 0, true, false);
+        check_cell(b"$A$1", 0, 0, true, true);
+        check_cell(b"XFD1048576", MAX_ROWS - 1, MAX_COLUMNS - 1, false, false);
+
+        // Column references
+        check_column(b"A", 0, false);
+        check_column(b"$A", 0, true);
+        check_column(b"XFD", MAX_COLUMNS - 1, false);
+
+        // Row references
+        check_row(b"1", 0, false);
+        check_row(b"$1", 0, true);
+        check_row(b"1048576", MAX_ROWS - 1, false);
+    }
+
+    #[test]
+    fn test_format_reference() {
+        let check_cell = |row, col, abs_row, abs_col, expected: &[u8]| {
+            let mut buf = Vec::new();
+            Reference::Cell {
+                row,
+                col,
+                absolute_row: abs_row,
+                absolute_col: abs_col,
+            }
+            .format(&mut buf)
+            .unwrap();
+            assert_eq!(buf, expected);
+        };
+
+        let check_column = |col, absolute, expected: &[u8]| {
+            let mut buf = Vec::new();
+            Reference::Column { col, absolute }
+                .format(&mut buf)
+                .unwrap();
+            assert_eq!(buf, expected);
+        };
+
+        let check_row = |row, absolute, expected: &[u8]| {
+            let mut buf = Vec::new();
+            Reference::Row { row, absolute }.format(&mut buf).unwrap();
+            assert_eq!(buf, expected);
+        };
+
+        // Cell references
+        check_cell(0, 0, false, false, b"A1");
+        check_cell(0, 0, false, true, b"$A1");
+        check_cell(0, 0, true, false, b"A$1");
+        check_cell(0, 0, true, true, b"$A$1");
+        check_cell(MAX_ROWS - 1, MAX_COLUMNS - 1, false, false, b"XFD1048576");
+
+        // Column references
+        check_column(0, false, b"A");
+        check_column(0, true, b"$A");
+        check_column(MAX_COLUMNS - 1, false, b"XFD");
+
+        // Row references
+        check_row(0, false, b"1");
+        check_row(0, true, b"$1");
+        check_row(MAX_ROWS - 1, false, b"1048576");
+    }
+
+    #[test]
+    fn test_format_reference_overflow() {
+        let check_err = |reference: Reference, offset| {
+            let result = reference.offset(offset);
+            assert!(
+                matches!(
+                    result,
+                    Err(XlsxError::ColumnNumberOverflow) | Err(XlsxError::RowNumberOverflow)
+                ),
+                "expected overflow error, got {:?}",
+                result
+            );
+        };
+
+        // Cell reference offset pushes column out of bounds
+        check_err(
+            Reference::Cell {
+                row: 0,
+                col: MAX_COLUMNS - 1,
+                absolute_row: false,
+                absolute_col: false,
+            },
+            (0, 1),
         );
+
+        // Cell reference offset pushes row out of bounds
+        check_err(
+            Reference::Cell {
+                row: MAX_ROWS - 1,
+                col: 0,
+                absolute_row: false,
+                absolute_col: false,
+            },
+            (1, 0),
+        );
+
+        // Column reference offset pushes out of bounds
+        check_err(
+            Reference::Column {
+                col: MAX_COLUMNS - 1,
+                absolute: false,
+            },
+            (0, 1),
+        );
+
+        // Row reference offset pushes out of bounds
+        check_err(
+            Reference::Row {
+                row: MAX_ROWS - 1,
+                absolute: false,
+            },
+            (1, 0),
+        );
+    }
+
+    #[test]
+    fn test_offset_range() {
+        let check = |input: &[u8], offset, expected: &[u8]| {
+            let mut buf = Vec::new();
+            offset_range(input, offset, &mut buf).unwrap();
+            assert_eq!(buf, expected);
+        };
+
+        let check_err = |input: &[u8], offset| {
+            let mut buf = Vec::new();
+            let res = offset_range(input, offset, &mut buf);
+            assert!(res.is_err());
+            assert_eq!(buf.len(), 0)
+        };
+
+        // Cell references
+        check(b"A1", (1, 1), b"B2");
+        check(b"$A1", (1, 1), b"$A2");
+        check(b"A$1", (1, 1), b"B$1");
+        check(b"$A$1", (1, 1), b"$A$1");
+
+        // Column references
+        check_err(b"E", (0, 1));
+        check_err(b"$E", (0, 1));
+
+        // Row references
+        check_err(b"5", (1, 0));
+        check_err(b"$5", (1, 0));
+
+        // Cell ranges
+        check(b"A1:B2", (1, 1), b"B2:C3");
+        check(b"$A$1:$B$2", (1, 1), b"$A$1:$B$2");
+
+        // Column ranges
+        check(b"E:F", (0, 1), b"F:G");
+        check(b"$E:$F", (0, 1), b"$E:$F");
+        check(b"E:F", (1, 0), b"E:F");
+
+        // Row ranges
+        check(b"5:6", (1, 0), b"6:7");
+        check(b"$5:$6", (1, 0), b"$5:$6");
+        check(b"5:6", (0, 1), b"5:6");
+    }
+
+    #[test]
+    fn test_parse_reference_overflow() {
+        let check_col_err = |input: &[u8]| {
+            assert!(matches!(
+                Reference::parse(input),
+                Err(XlsxError::ColumnNumberOverflow)
+            ));
+        };
+        let check_row_err = |input: &[u8]| {
+            assert!(matches!(
+                Reference::parse(input),
+                Err(XlsxError::RowNumberOverflow)
+            ));
+        };
+        let check_syntax_err = |input: &[u8]| {
+            assert!(matches!(
+                Reference::parse(input),
+                Err(XlsxError::Alphanumeric(_))
+            ));
+        };
+
+        // Invalid syntax
+        check_syntax_err(b"A$A1");
+        check_syntax_err(b"A1$2");
+        check_syntax_err(b"$$A1");
+        check_syntax_err(b"$A$$1");
+        check_syntax_err(b"A$$1");
+        check_syntax_err(b"1A");
+        check_syntax_err(b"1A1");
+        check_syntax_err(b"A1B2");
+
+        // Cell references
+        check_col_err(b"XFE1");
+        check_col_err(b"AAAA1");
+        check_row_err(b"A1048577");
+        check_row_err(b"A99999999999999999999");
+        check_col_err(b"$XFE$1");
+
+        // Column references
+        check_col_err(b"XFE");
+        check_col_err(b"$XFE");
+
+        // Row references
+        check_row_err(b"1048577");
+        check_row_err(b"$1048577");
+    }
+
+    #[test]
+    fn test_offset_range_overflow() {
+        let check_col_err = |input: &[u8], offset| {
+            let mut buf = Vec::new();
+            assert!(matches!(
+                offset_range(input, offset, &mut buf),
+                Err(XlsxError::ColumnNumberOverflow)
+            ));
+        };
+        let check_row_err = |input: &[u8], offset| {
+            let mut buf = Vec::new();
+            assert!(matches!(
+                offset_range(input, offset, &mut buf),
+                Err(XlsxError::RowNumberOverflow)
+            ));
+        };
+
+        // Original reference is out of bounds
+        check_col_err(b"XFE1", (0, 0));
+        check_col_err(b"$XFE$1", (0, 0));
+        check_row_err(b"A1048577", (0, 0));
+        check_row_err(b"$A$1048577", (0, 0));
+        check_col_err(b"XFE:XFE", (0, 0));
+        check_row_err(b"1048577:1048577", (0, 0));
+
+        // Offset pushes valid cell out of bounds
+        check_col_err(b"XFD1", (0, 1));
+        check_row_err(b"A1048576", (1, 0));
+        check_row_err(b"XFD1048576", (1, 0));
+        check_col_err(b"XFD1048576", (0, 1));
+
+        // Offset pushes valid range out of bounds
+        check_col_err(b"XFD:XFD", (0, 1));
+        check_row_err(b"1048576:1048576", (1, 0));
     }
 
     #[test]
@@ -2083,6 +2578,60 @@ mod tests {
             )
             .unwrap(),
             "A2 is a cell, B2 is another, also C108, but XFE123 is not and \"A3\" in quote wont change.".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("한글 A1 テスト", (0, 1)).unwrap(),
+            "한글 B1 テスト".to_owned()
+        );
+
+        assert_eq!(
+            replace_cell_names("ABC\"asd\"123", (1, 0)).unwrap(),
+            "ABC\"asd\"123".to_owned()
+        );
+
+        // Column ranges
+        assert_eq!(
+            replace_cell_names("SUM(E:F)", (0, 1)).unwrap(),
+            "SUM(F:G)".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM($E:$F)", (0, 1)).unwrap(),
+            "SUM($E:$F)".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM($E:F)", (0, 1)).unwrap(),
+            "SUM($E:G)".to_owned()
+        );
+
+        // Row ranges
+        assert_eq!(
+            replace_cell_names("SUM(5:6)", (1, 0)).unwrap(),
+            "SUM(6:7)".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM($5:$6)", (1, 0)).unwrap(),
+            "SUM($5:$6)".to_owned()
+        );
+        assert_eq!(
+            replace_cell_names("SUM($5:6)", (1, 0)).unwrap(),
+            "SUM($5:7)".to_owned()
+        );
+
+        // Mixed with cell references
+        assert_eq!(
+            replace_cell_names("SUM(A1:A5,E:F)", (0, 1)).unwrap(),
+            "SUM(B1:B5,F:G)".to_owned()
+        );
+
+        // Invalid syntax
+        assert_eq!(
+            replace_cell_names(
+                "Valid: A1 Invalid: A1B1 A1$ $$A1 $A$$1 A$$1 A:1 1:A 1 A A1:1 A1:B A$A1 A1$2 $1 $A Valid: C1:D1",
+                (1, 1)
+            )
+            .unwrap(),
+            "Valid: B2 Invalid: A1B1 A1$ $$A1 $A$$1 A$$1 A:1 1:A 1 A A1:1 A1:B A$A1 A1$2 $1 $A Valid: D2:E2"
+                .to_owned()
         );
     }
 

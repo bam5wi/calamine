@@ -2,12 +2,14 @@
 //
 // Copyright 2016-2025, Johann Tuffe.
 
+use calamine::vba::Reference;
 use calamine::Data::{Bool, DateTime, DateTimeIso, DurationIso, Empty, Error, Float, Int, String};
-use calamine::{CellErrorType::*, Data};
 use calamine::{
-    DataRef, DataType, Dimensions, ExcelDateTime, ExcelDateTimeType, HeaderRow, Ods, Range, Reader,
-    ReaderRef, Sheet, SheetType, SheetVisible, Xls, Xlsb, Xlsx, open_workbook, open_workbook_auto,
+    open_workbook, open_workbook_auto, DataRef, DataType, Dimensions, ExcelDateTime,
+    ExcelDateTimeType, HeaderRow, Ods, Range, Reader, ReaderRef, Sheet, SheetType, SheetVisible,
+    Xls, Xlsb, Xlsx,
 };
+use calamine::{CellErrorType::*, Data};
 use rstest::rstest;
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -16,12 +18,16 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 
+fn test_path(name: &str) -> std::string::String {
+    format!("tests/{name}")
+}
+
 /// Setup function that is only run once, even if called multiple times.
 fn wb<R: Reader<BufReader<File>>>(name: &str) -> R {
     INIT.call_once(|| {
         env_logger::init();
     });
-    let path = format!("{}/tests/{name}", env!("CARGO_MANIFEST_DIR"));
+    let path = test_path(name);
     open_workbook(&path).expect(&path)
 }
 
@@ -120,9 +126,9 @@ fn issue_9() {
 #[test]
 fn vba() {
     let mut excel: Xlsx<_> = wb("vba.xlsm");
-    let mut vba = excel.vba_project().unwrap().unwrap();
+    let vba = excel.vba_project().unwrap().unwrap();
     assert_eq!(
-        vba.to_mut().get_module("testVBA").unwrap(),
+        vba.get_module("testVBA").unwrap(),
         "Attribute VB_Name = \"testVBA\"\r\nPublic Sub test()\r\n    MsgBox \"Hello from \
          vba!\"\r\nEnd Sub\r\n"
     );
@@ -166,6 +172,35 @@ fn xls() {
             [Float(1.), String("a".to_string())],
             [Float(2.), String("b".to_string())],
             [Float(3.), String("c".to_string())]
+        ]
+    );
+    let vba = excel.vba_project().unwrap().unwrap();
+    let references = vba.get_references();
+    assert_eq!(
+        references,
+        [
+            Reference {
+                name: "stdole".to_string(),
+                description: "OLE Automation".to_string(),
+                path: "C:\\Windows\\SysWOW64\\stdole2.tlb".into(),
+            },
+            Reference {
+                name: "Office".to_string(),
+                description: "Microsoft Office 16.0 Object Library".to_string(),
+                path: "C:\\Program Files (x86)\\Common Files\\Microsoft Shared\\OFFICE16\\MSO.DLL"
+                    .into(),
+            },
+        ]
+    );
+    assert_eq!(
+        vba.get_module_names(),
+        [
+            "Sheet1",
+            "Sheet2",
+            "Sheet3",
+            "Sheet4",
+            "ThisWorkbook",
+            "testVBA",
         ]
     );
 }
@@ -300,6 +335,42 @@ fn special_chrs_ods() {
     );
 }
 
+// Test for decoding/unescaping simple XML entities and also for numeric
+// entities like "&#xA;" for new line.
+#[test]
+fn decode_xml_entities() {
+    let mut excel: Xlsx<_> = wb("encoded_entities.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    assert_eq!(range.get_value((0, 0)), Some(&String("&".to_string())));
+    assert_eq!(range.get_value((1, 0)), Some(&String("\n".to_string())));
+}
+
+// Test for unescaping Excel XML escapes in a cell string. Excel encodes a
+// character like "\r" as "_x000D_". In turn it escapes the literal string
+// "_x000D_" as "_x005F_x000D_".
+//
+// See https://github.com/tafia/calamine/issues/469
+#[test]
+fn unescape_excel_xml() {
+    let mut excel: Xlsx<_> = wb("has_x000D_.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    assert_eq!(
+        range.get_value((0, 0)),
+        Some(&String("ABC\r\nDEF".to_string()))
+    );
+
+    // Test a file with an inline string.
+    let mut excel: Xlsx<_> = wb("has_x000D_inline.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    assert_eq!(
+        range.get_value((0, 0)),
+        Some(&String("ABC\r\nDEF".to_string()))
+    );
+}
+
 #[test]
 fn partial_richtext_ods() {
     let mut excel: Ods<_> = wb("richtext_issue.ods");
@@ -314,14 +385,14 @@ fn xlsx_richtext_namespaced() {
     range_eq!(
         range,
         [[
-            String("inline string\r\nLine 2\r\nLine 3".to_string()),
+            String("inline string\nLine 2\nLine 3".to_string()),
             Empty,
             Empty,
             Empty,
             Empty,
             Empty,
             Empty,
-            String("shared string\r\nLine 2\r\nLine 3".to_string())
+            String("shared string\nLine 2\nLine 3".to_string())
         ]]
     );
 }
@@ -333,7 +404,7 @@ fn defined_names_xlsx() {
     defined_names.sort();
     assert_eq!(
         defined_names,
-        vec![
+        [
             ("MyBrokenRange".to_string(), "Sheet1!#REF!".to_string()),
             ("MyDataTypes".to_string(), "datatypes!$A$1:$A$6".to_string()),
             ("OneRange".to_string(), "Sheet1!$A$1".to_string()),
@@ -348,7 +419,7 @@ fn defined_names_xlsb() {
     defined_names.sort();
     assert_eq!(
         defined_names,
-        vec![
+        [
             ("MyBrokenRange".to_string(), "Sheet1!#REF!".to_string()),
             ("MyDataTypes".to_string(), "datatypes!$A$1:$A$6".to_string()),
             ("OneRange".to_string(), "Sheet1!$A$1".to_string()),
@@ -358,16 +429,45 @@ fn defined_names_xlsb() {
 
 #[test]
 fn defined_names_xls() {
-    let excel: Xls<_> = wb("issues.xls");
+    let mut excel: Xls<_> = wb("issues.xls");
     let mut defined_names = excel.defined_names().to_vec();
     defined_names.sort();
     assert_eq!(
         defined_names,
-        vec![
+        [
             ("MyBrokenRange".to_string(), "Sheet1!#REF!".to_string()),
             ("MyDataTypes".to_string(), "datatypes!$A$1:$A$6".to_string()),
             ("OneRange".to_string(), "Sheet1!$A$1".to_string()),
         ]
+    );
+    let vba = excel.vba_project().unwrap().unwrap();
+    let references = vba.get_references();
+    assert_eq!(
+        references,
+        [
+            Reference {
+                name: "stdole".to_string(),
+                description: "OLE Automation".to_string(),
+                path: "C:\\Windows\\SysWOW64\\stdole2.tlb".into(),
+            },
+            Reference {
+                name: "Office".to_string(),
+                description: "Microsoft Office 16.0 Object Library".to_string(),
+                path: "C:\\Program Files (x86)\\Common Files\\Microsoft Shared\\OFFICE16\\MSO.DLL"
+                    .into(),
+            },
+        ]
+    );
+    assert_eq!(
+        vba.get_module_names(),
+        [
+            "Sheet1",
+            "Sheet2",
+            "Sheet3",
+            "Sheet4",
+            "ThisWorkbook",
+            "testVBA",
+        ],
     );
 }
 
@@ -378,7 +478,7 @@ fn defined_names_ods() {
     defined_names.sort();
     assert_eq!(
         defined_names,
-        vec![
+        [
             (
                 "MyBrokenRange".to_string(),
                 "of:=[Sheet1.#REF!]".to_string(),
@@ -412,7 +512,7 @@ fn search_references() {
     let vba = excel.vba_project().unwrap().unwrap();
     let references = vba.get_references();
     let names = references.iter().map(|r| &*r.name).collect::<Vec<&str>>();
-    assert_eq!(names, vec!["stdole", "Office"]);
+    assert_eq!(names, ["stdole", "Office"]);
 }
 
 #[test]
@@ -475,6 +575,35 @@ fn formula_xls() {
 
     let formula = excel.worksheet_formula("Sheet1").unwrap();
     range_eq!(formula, [["B1+OneRange".to_string()]]);
+    let vba = excel.vba_project().unwrap().unwrap();
+    let references = vba.get_references();
+    assert_eq!(
+        references,
+        [
+            Reference {
+                name: "stdole".to_string(),
+                description: "OLE Automation".to_string(),
+                path: "C:\\Windows\\SysWOW64\\stdole2.tlb".into(),
+            },
+            Reference {
+                name: "Office".to_string(),
+                description: "Microsoft Office 16.0 Object Library".to_string(),
+                path: "C:\\Program Files (x86)\\Common Files\\Microsoft Shared\\OFFICE16\\MSO.DLL"
+                    .into(),
+            },
+        ]
+    );
+    assert_eq!(
+        vba.get_module_names(),
+        [
+            "Sheet1",
+            "Sheet2",
+            "Sheet3",
+            "Sheet4",
+            "ThisWorkbook",
+            "testVBA",
+        ]
+    );
 }
 
 #[test]
@@ -514,16 +643,15 @@ fn issue_120() {
 
 #[test]
 fn issue_127() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let ordered_names: Vec<std::string::String> = [
+    let ordered_names: Vec<_> = [
         "Sheet1", "Sheet2", "Sheet3", "Sheet4", "Sheet5", "Sheet6", "Sheet7", "Sheet8",
     ]
     .iter()
-    .map(|&s| s.to_owned())
+    .map(|&s| s.to_string())
     .collect();
 
     for ext in &["ods", "xls", "xlsx", "xlsb"] {
-        let p = format!("{root}/tests/issue127.{ext}");
+        let p = test_path(&format!("issue127.{ext}"));
         let workbook = open_workbook_auto(&p).expect(&p);
         assert_eq!(
             workbook.sheet_names(),
@@ -714,7 +842,7 @@ fn date_xls() {
         )))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -749,7 +877,7 @@ fn date_xls_1904() {
         )))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -784,7 +912,7 @@ fn date_xlsx() {
         )))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -819,7 +947,7 @@ fn date_xlsx_1904() {
         )))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -850,7 +978,7 @@ fn date_xlsx_iso() {
         Some(&DateTimeIso("10:10:10".to_string()))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -894,7 +1022,7 @@ fn date_ods() {
         Some(&DurationIso("PT10H10M10.123456S".to_string()))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -942,7 +1070,7 @@ fn date_xlsb() {
         )))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -977,7 +1105,7 @@ fn date_xlsb_1904() {
         )))
     );
 
-    #[cfg(feature = "dates")]
+    #[cfg(feature = "chrono")]
     {
         let date = chrono::NaiveDate::from_ymd_opt(2021, 1, 1).unwrap();
         assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
@@ -1022,7 +1150,7 @@ fn merged_regions_xlsx() {
             .iter()
             .map(|(o1, o2, o3)| (o1.to_string(), o2.to_string(), *o3))
             .collect::<BTreeSet<(String, String, Dimensions)>>(),
-        vec![
+        [
             (
                 "Sheet1".to_string(),
                 "xl/worksheets/sheet1.xml".to_string(),
@@ -1108,7 +1236,7 @@ fn merged_regions_xlsx() {
             .iter()
             .map(|&(o1, o2, o3)| (o1.to_string(), o2.to_string(), *o3))
             .collect::<BTreeSet<(String, String, Dimensions)>>(),
-        vec![
+        [
             (
                 "Sheet1".to_string(),
                 "xl/worksheets/sheet1.xml".to_string(),
@@ -1164,7 +1292,7 @@ fn merged_regions_xlsx() {
             .iter()
             .map(|&(o1, o2, o3)| (o1.to_string(), o2.to_string(), *o3))
             .collect::<BTreeSet<(String, String, Dimensions)>>(),
-        vec![
+        [
             (
                 "Sheet2".to_string(),
                 "xl/worksheets/sheet2.xml".to_string(),
@@ -1308,7 +1436,7 @@ fn issue_305_merge_cells() {
 
     assert_eq!(
         merge_cells,
-        vec![
+        [
             Dimensions::new((0, 0), (0, 1)),
             Dimensions::new((1, 0), (3, 0)),
             Dimensions::new((1, 1), (3, 3))
@@ -1323,7 +1451,7 @@ fn issue_305_merge_cells_xls() {
 
     assert_eq!(
         merge_cells,
-        vec![
+        [
             Dimensions::new((0, 0), (0, 1)),
             Dimensions::new((1, 0), (3, 0)),
             Dimensions::new((1, 1), (3, 3))
@@ -1343,9 +1471,8 @@ fn digest(data: &[u8]) -> [u8; 32] {
 #[test]
 #[cfg(feature = "picture")]
 fn pictures() -> Result<(), calamine::Error> {
-    let path = |name: &str| format!("{}/tests/{name}", env!("CARGO_MANIFEST_DIR"));
-    let jpg_path = path("picture.jpg");
-    let png_path = path("picture.png");
+    let jpg_path = test_path("picture.jpg");
+    let png_path = test_path("picture.png");
 
     let xlsx_path = "picture.xlsx";
     let xlsb_path = "picture.xlsb";
@@ -1524,9 +1651,9 @@ fn issue334_xls_values_string() {
 fn issue281_vba() {
     let mut excel: Xlsx<_> = wb("issue281.xlsm");
 
-    let mut vba = excel.vba_project().unwrap().unwrap();
+    let vba = excel.vba_project().unwrap().unwrap();
     assert_eq!(
-        vba.to_mut().get_module("testVBA").unwrap(),
+        vba.get_module("testVBA").unwrap(),
         "Attribute VB_Name = \"testVBA\"\r\nPublic Sub test()\r\n    MsgBox \"Hello from \
          vba!\"\r\nEnd Sub\r\n"
     );
@@ -1602,7 +1729,7 @@ fn any_sheets_xlsb() {
 
 #[test]
 fn any_sheets_xls() {
-    let workbook: Xls<_> = wb("any_sheets.xls");
+    let mut workbook: Xls<_> = wb("any_sheets.xls");
 
     assert_eq!(
         workbook.sheets_metadata(),
@@ -1628,6 +1755,27 @@ fn any_sheets_xls() {
                 visible: SheetVisible::Visible
             },
         ]
+    );
+    let vba = workbook.vba_project().unwrap().unwrap();
+    let references = vba.get_references();
+    assert_eq!(
+        references,
+        [
+            Reference {
+                name: "stdole".to_string(),
+                description: "OLE Automation".to_string(),
+                path: "C:\\Windows\\System32\\stdole2.tlb".into(),
+            },
+            Reference {
+                name: "Office".to_string(),
+                description: "Microsoft Office 16.0 Object Library".to_string(),
+                path: "C:\\Program Files\\Common Files\\Microsoft Shared\\OFFICE16\\MSO.DLL".into(),
+            },
+        ],
+    );
+    assert_eq!(
+        vba.get_module_names(),
+        ["Диаграмма4", "Лист1", "Лист2", "Лист3",],
     );
 }
 
@@ -1666,10 +1814,10 @@ fn any_sheets_ods() {
 
 #[test]
 fn issue_102() {
-    let path = format!("{}/tests/pass_protected.xlsx", env!("CARGO_MANIFEST_DIR"));
+    let path = test_path("pass_protected.xlsx");
     assert!(
         matches!(
-            open_workbook::<Xlsx<_>, std::string::String>(path),
+            open_workbook::<Xlsx<_>, _>(path),
             Err(calamine::XlsxError::Password)
         ),
         "Is expected to return XlsxError::Password error"
@@ -1693,10 +1841,10 @@ fn issue_374() {
 
 #[test]
 fn issue_385() {
-    let path = format!("{}/tests/issue_385.xls", env!("CARGO_MANIFEST_DIR"));
+    let path = test_path("issue_385.xls");
     assert!(
         matches!(
-            open_workbook::<Xls<_>, std::string::String>(path),
+            open_workbook::<Xls<_>, _>(path),
             Err(calamine::XlsError::Password)
         ),
         "Is expected to return XlsError::Password error"
@@ -1705,10 +1853,10 @@ fn issue_385() {
 
 #[test]
 fn pass_protected_xlsb() {
-    let path = format!("{}/tests/pass_protected.xlsb", env!("CARGO_MANIFEST_DIR"));
+    let path = test_path("pass_protected.xlsb");
     assert!(
         matches!(
-            open_workbook::<Xlsb<_>, std::string::String>(path),
+            open_workbook::<Xlsb<_>, _>(path),
             Err(calamine::XlsbError::Password)
         ),
         "Is expected to return XlsbError::Password error"
@@ -1717,10 +1865,10 @@ fn pass_protected_xlsb() {
 
 #[test]
 fn pass_protected_ods() {
-    let path = format!("{}/tests/pass_protected.ods", env!("CARGO_MANIFEST_DIR"));
+    let path = test_path("pass_protected.ods");
     assert!(
         matches!(
-            open_workbook::<Ods<_>, std::string::String>(path),
+            open_workbook::<Ods<_>, _>(path),
             Err(calamine::OdsError::Password)
         ),
         "Is expected to return OdsError::Password error"
@@ -1786,6 +1934,171 @@ fn issue_391_shared_formula() {
     assert_eq!(expect.start(), res.start());
     assert_eq!(expect.end(), res.end());
     assert!(expect.cells().eq(res.cells()));
+}
+
+#[test]
+fn issue_553_non_ascii_shared_formula() {
+    // Test incrementing a shared formula in an xlsx file where the formula
+    // contains utf-8 characters.
+    let mut excel: Xlsx<_> = wb("issue_553.xlsx");
+    let formula = excel.worksheet_formula("Sheet1").unwrap();
+    assert!(formula
+        .cells()
+        .all(|(_, _, x)| x == r#"IF(ROW()>5,"한글","영어")"#))
+}
+
+#[test]
+fn non_monotonic_si_shared_formula() {
+    // This excel has been manually edited so that the si numbers do not monotonically increase (si
+    // 0 swapped with 1)
+    let mut excel: Xlsx<_> = wb("non_monotonic_si.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+    let formula = excel.worksheet_formula("Sheet1").unwrap();
+
+    let expected_values = [
+        [Float(1.), Float(2.), Float(3.)],
+        [Float(2.), Float(4.), Float(6.)],
+        [Float(3.), Float(6.), Float(9.)],
+        [Float(4.), Float(8.), Float(12.)],
+        [Float(5.), Float(10.), Float(15.)],
+        [Float(6.), Float(12.), Float(18.)],
+    ];
+    range_eq!(range, expected_values);
+
+    let expected_formulas = [
+        ["A1+1", "B1+2", "C1+3"],
+        ["A2+1", "B2+2", "C2+3"],
+        ["A3+1", "B3+2", "C3+3"],
+        ["A4+1", "B4+2", "C4+3"],
+        ["A5+1", "B5+2", "C5+3"],
+    ];
+
+    for (row_idx, row) in expected_formulas.iter().enumerate() {
+        for (col_idx, expected_formula) in row.iter().enumerate() {
+            assert_eq!(
+                formula.get_value((row_idx as u32 + 1, col_idx as u32)),
+                Some(&expected_formula.to_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_565_multi_axis_shared_formula() {
+    // B1:D2 contains a shared formula that expands in 2 dimnensions
+    let mut excel: Xlsx<_> = wb("issue_565_multi_axis_shared.xlsx");
+    let formula = excel.worksheet_formula("Sheet1").unwrap();
+
+    let expected_formulas = [["A1", "B1", "C1", "D1"], ["A2", "B2", "C2", "D2"]];
+
+    for (row_idx, row) in expected_formulas.iter().enumerate() {
+        for (col_idx, expected_formula) in row.iter().enumerate() {
+            assert_eq!(
+                formula.get_value((row_idx as u32, col_idx as u32)),
+                Some(&expected_formula.to_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_formula_reversed() {
+    // One sheet has a shared formula created by dragging downwards, the other has one created
+    // by dragging upwards.
+    let mut excel: Xlsx<_> = wb("shared_formula_reversed.xlsx");
+
+    for sheet_name in &["Sheet1", "Sheet2"] {
+        let range = excel.worksheet_range(sheet_name).unwrap();
+        let formula = excel.worksheet_formula(sheet_name).unwrap();
+
+        let expected_values = [Float(1.), Float(2.), Float(3.), Float(4.), Float(5.)];
+
+        for (row_idx, expected_value) in expected_values.iter().enumerate() {
+            assert_eq!(range.get_value((row_idx as u32, 1)), Some(expected_value));
+        }
+
+        let expected_formulas = ["A1", "A2", "A3", "A4", "A5"];
+
+        for (row_idx, expected_formula) in expected_formulas.iter().enumerate() {
+            assert_eq!(
+                formula.get_value((row_idx as u32, 1)),
+                Some(&expected_formula.to_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_567_absolute_shared_formula() {
+    // Test absolute references in shared formulas. B$1 dragged to E3 should increment
+    // the column (B, C, D, E) but keep the row fixed at 1.
+    let mut excel: Xlsx<_> = wb("issue_567_absolute_shared.xlsx");
+    let formula = excel.worksheet_formula("Sheet1").unwrap();
+
+    let expected_formulas = [
+        ["A$1", "B$1", "C$1", "D$1", "E$1"],
+        ["A$1", "B$1", "C$1", "D$1", "E$1"],
+        ["A$1", "B$1", "C$1", "D$1", "E$1"],
+    ];
+
+    for (row_idx, row) in expected_formulas.iter().enumerate() {
+        for (col_idx, expected_formula) in row.iter().enumerate() {
+            assert_eq!(
+                formula.get_value((row_idx as u32, col_idx as u32)),
+                Some(&expected_formula.to_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn column_row_ranges() {
+    // Test column and row ranges in formulas (e.g., E:F, 5:6)
+    let mut excel: Xlsx<_> = wb("column_row_ranges.xlsx");
+
+    // Test column ranges (E:F, F:G, G:H)
+    let formula = excel.worksheet_formula("Column ranges").unwrap();
+
+    let expected_formulas = [
+        ["SUM(E:F)", "SUM(F:G)", "SUM(G:H)"],
+        ["SUM(E:F)", "SUM(F:G)", "SUM(G:H)"],
+        ["SUM(E:F)", "SUM(F:G)", "SUM(G:H)"],
+        ["SUM(E:F)", "SUM(F:G)", "SUM(G:H)"],
+        ["SUM(E:F)", "SUM(F:G)", "SUM(G:H)"],
+    ];
+
+    for (row_idx, row) in expected_formulas.iter().enumerate() {
+        for (col_idx, expected_formula) in row.iter().enumerate() {
+            assert_eq!(
+                formula.get_value((row_idx as u32, col_idx as u32)),
+                Some(&expected_formula.to_string()),
+                "Column ranges mismatch at ({}, {})",
+                row_idx,
+                col_idx
+            );
+        }
+    }
+
+    // Test row ranges (5:6, 6:7, 7:8)
+    let formula = excel.worksheet_formula("Row ranges").unwrap();
+
+    let expected_formulas = [
+        ["SUM(5:6)", "SUM(5:6)", "SUM(5:6)", "SUM(5:6)", "SUM(5:6)"],
+        ["SUM(6:7)", "SUM(6:7)", "SUM(6:7)", "SUM(6:7)", "SUM(6:7)"],
+        ["SUM(7:8)", "SUM(7:8)", "SUM(7:8)", "SUM(7:8)", "SUM(7:8)"],
+    ];
+
+    for (row_idx, row) in expected_formulas.iter().enumerate() {
+        for (col_idx, expected_formula) in row.iter().enumerate() {
+            assert_eq!(
+                formula.get_value((row_idx as u32, col_idx as u32)),
+                Some(&expected_formula.to_string()),
+                "Row ranges mismatch at ({}, {})",
+                row_idx,
+                col_idx
+            );
+        }
+    }
 }
 
 #[test]
@@ -2151,6 +2464,46 @@ fn test_oom_allocation() {
     let ws = xls.worksheets();
     assert_eq!(ws.len(), 1);
     assert_eq!(ws[0].0, "Colsale (Aug".to_string());
+
+    let path = test_path("OOM_alloc3.xls");
+    assert!(
+        matches!(
+            open_workbook::<Xls<_>, _>(path),
+            Err(calamine::XlsError::Cfb(_))
+        ),
+        "Is expected to return XlsError::Cfb error"
+    );
+}
+
+// Test for issue #548. The SST table in the test file has an incorrect unique
+// string count.
+#[test]
+fn test_incorrect_sst_unique_count() {
+    // Check for the string that appears last in the SST table: "11th May 2023".
+    // This appears in cell C10 of each worksheet in the workbook.
+    let mut xls: Xls<_> = wb("gh548_incorrect_sst_unique_count.xls");
+    let range = xls.worksheet_range("System Level Data").unwrap();
+
+    assert_eq!(
+        range.get_value((9, 2)).unwrap(),
+        &String("11th May 2023".into())
+    );
+}
+
+// Test the parsing of an SST table that finishes with a complete, untruncated,
+// string at the end of the block, and where the next string is in a CONTINUE
+// block. This is related to the previous test for gh548 to ensure that the edge
+// condition is met.
+#[test]
+fn test_sst_continue() {
+    let mut xls: Xls<_> = wb("sst_continue.xls");
+    let range = xls.worksheet_range("Sheet1").unwrap();
+
+    // Check for the string that appears last in the SST table.
+    assert_eq!(
+        range.get_value((135, 0)).unwrap(),
+        &String("New CONTINUE block".into())
+    );
 }
 
 // Test for issue #419 where the part name is sentence case instead of camel
@@ -2184,4 +2537,17 @@ fn test_xlsb_case_insensitive_part_name() {
 #[test]
 fn test_xlsx_backward_slash_part_name() {
     let _: Xlsx<_> = wb("issue_530.xlsx");
+}
+
+// Test for issue #573 where a shared string doesn't have a <t> sub-element.
+// This is unusual but valid according to the xlsx specification.
+#[test]
+fn test_xlsx_empty_shared_string() {
+    let mut excel: Xlsx<_> = wb("empty_shared_string.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    range_eq!(
+        range,
+        [[String("abc".to_string())], [String("".to_string())]]
+    );
 }

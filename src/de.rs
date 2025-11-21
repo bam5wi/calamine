@@ -40,24 +40,21 @@ pub enum DeError {
 
 impl fmt::Display for DeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        match *self {
-            DeError::CellOutOfRange {
-                ref try_pos,
-                ref min_pos,
-            } => write!(
+        match self {
+            DeError::CellOutOfRange { try_pos, min_pos } => write!(
                 f,
                 "there is no cell at position '{try_pos:?}'. Minimum position is '{min_pos:?}'"
             ),
-            DeError::CellError { ref pos, ref err } => {
+            DeError::CellError { pos, err } => {
                 write!(f, "Cell error at position '{pos:?}': {err}")
             }
-            DeError::UnexpectedEndOfRow { ref pos } => {
+            DeError::UnexpectedEndOfRow { pos } => {
                 write!(f, "Unexpected end of row at position '{pos:?}'")
             }
-            DeError::HeaderNotFound(ref header) => {
+            DeError::HeaderNotFound(header) => {
                 write!(f, "Cannot find header named '{header}'")
             }
-            DeError::Custom(ref s) => write!(f, "{s}"),
+            DeError::Custom(s) => write!(f, "{s}"),
         }
     }
 }
@@ -400,17 +397,17 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let RangeDeserializer {
-            ref column_indexes,
-            ref headers,
-            ref mut rows,
-            mut current_pos,
+            column_indexes,
+            headers,
+            rows,
+            current_pos,
             ..
-        } = *self;
+        } = self;
 
         if let Some(row) = rows.next() {
             current_pos.0 += 1;
             let headers = headers.as_ref().map(|h| &**h);
-            let de = RowDeserializer::new(column_indexes, headers, row, current_pos);
+            let de = RowDeserializer::new(column_indexes, headers, row, *current_pos);
             Some(Deserialize::deserialize(de))
         } else {
             None
@@ -615,7 +612,7 @@ macro_rules! deserialize_num {
                     err: err.clone(),
                     pos: self.pos,
                 }),
-                ref d => Err(DeError::Custom(format!(
+                d => Err(DeError::Custom(format!(
                     "Expecting {}, got {:?}",
                     stringify!($typ),
                     d
@@ -685,7 +682,7 @@ impl<'a, 'de> serde::Deserializer<'de> for DataDeserializer<'a> {
                 err: err.clone(),
                 pos: self.pos,
             }),
-            ref d => Err(DeError::Custom(format!("Expecting bytes, got {d:?}"))),
+            d => Err(DeError::Custom(format!("Expecting bytes, got {d:?}"))),
         }
     }
 
@@ -739,7 +736,7 @@ impl<'a, 'de> serde::Deserializer<'de> for DataDeserializer<'a> {
                 err: err.clone(),
                 pos: self.pos,
             }),
-            ref d => Err(DeError::Custom(format!("Expecting unit, got {d:?}"))),
+            d => Err(DeError::Custom(format!("Expecting unit, got {d:?}"))),
         }
     }
 
@@ -753,7 +750,7 @@ impl<'a, 'de> serde::Deserializer<'de> for DataDeserializer<'a> {
                 err: err.clone(),
                 pos: self.pos,
             }),
-            ref d => Err(DeError::Custom(format!("Expecting unit, got {d:?}"))),
+            d => Err(DeError::Custom(format!("Expecting unit, got {d:?}"))),
         }
     }
 
@@ -795,7 +792,7 @@ impl<'a, 'de> serde::Deserializer<'de> for DataDeserializer<'a> {
                 err: err.clone(),
                 pos: self.pos,
             }),
-            ref d => Err(DeError::Custom(format!("Expecting enum, got {d:?}"))),
+            d => Err(DeError::Custom(format!("Expecting enum, got {d:?}"))),
         }
     }
 

@@ -151,8 +151,7 @@ if let Some(Ok(range)) = workbook.worksheet_range("Sheet1") {
 }
 
 // Check if the workbook has a vba project
-if let Some(Ok(mut vba)) = workbook.vba_project() {
-    let vba = vba.to_mut();
+if let Ok(Some(vba)) = workbook.vba_project() {
     let module1 = vba.get_module("Module 1").unwrap();
     println!("Module 1 code:");
     println!("{}", module1);
@@ -182,10 +181,22 @@ for s in sheets {
 }
 ```
 
-## Features
 
-- `dates`: Add date related fn to `DataType`.
-- `picture`: Extract picture data.
+## Crate Features
+
+The following is a list of the optional features supported by the `calamine`
+crate. They are all off by default.
+
+- `chrono`: Adds support for Chrono date/time types to the API.
+- `dates`: A deprecated backwards compatible synonym for the `chrono` feature.
+- `picture`: Adds support for reading raw data for pictures in spreadsheets.
+
+A `calamine` feature can be enabled in your `Cargo.toml` file as follows:
+
+```bash
+cargo add calamine -F chrono
+```
+
 
 ### Others
 
