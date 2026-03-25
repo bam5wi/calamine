@@ -2551,3 +2551,321 @@ fn test_xlsx_empty_shared_string() {
         [[String("abc".to_string())], [String("".to_string())]]
     );
 }
+
+// Test for issue #607 where a shared string in a cell doesn't have a <v> index.
+#[test]
+fn test_xlsx_empty_shared_string_value() {
+    let mut excel: Xlsx<_> = wb("empty_shared_string_value.xlsx");
+    let range = excel.worksheet_range("Sheet1").unwrap();
+
+    range_eq!(
+        range,
+        [
+            [
+                String("Name".to_string()),
+                String("City".to_string()),
+                String("Status".to_string())
+            ],
+            [
+                String("Alice".to_string()),
+                Empty,
+                String("Active".to_string())
+            ],
+            [Empty, String("Berlin".to_string()), Empty,]
+        ]
+    );
+}
+
+// Test for issue #587, an xlsx file where table references IDs are absolute
+// instead of relative, i.e., "/xl/tables/table1.xml" instead of the Excel
+// generated "../tables/table1.xml".
+#[test]
+fn test_xlsx_table_reference_ids() {
+    let mut workbook: Xlsx<_> = wb("table_with_absolute_paths.xlsx");
+    workbook.load_tables().unwrap();
+
+    assert!(!workbook.table_names().is_empty());
+}
+
+// Test for issue #589, an xlsx file where the table element has the `insertRow`
+// attribute set.
+#[test]
+fn test_xlsx_table_insertrow_attribute() {
+    let mut workbook: Xlsx<_> = wb("table_with_insertrow_attribute.xlsx");
+    workbook.load_tables().unwrap();
+
+    let result = workbook.table_by_name("Table4");
+
+    assert!(result.is_ok(), "Expected table_by_name to succeed");
+}
+
+// Test for issue #594: ODS DoS protection via repeat limits.
+// This test verifies that the ODS parser correctly caps malicious repeat values
+// that would otherwise cause memory exhaustion.
+#[test]
+fn test_ods_dos_protection() {
+    // issue_594_dos.ods contains a malicious ODS file with excessive repeat values
+    // (999999999 rows x 999999999 columns). The parser should reject this with a
+    // cell limit error rather than hanging or exhausting memory.
+    let path = test_path("issue_594_dos.ods");
+    let ods: Result<Ods<_>, _> = open_workbook(&path);
+
+    // The file should fail to parse because cell limit is exceeded
+    let err = match ods {
+        Ok(_) => panic!("Should return error for excessive cell count"),
+        Err(e) => e,
+    };
+
+    // Verify it's the right error type
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("Cell limit exceeded"),
+        "Error should indicate cell limit exceeded: {err_msg}"
+    );
+}
+
+#[test]
+fn test_pivot_table_meta_data() {
+    let mut wb: Xlsx<_> = wb("pivots.xlsx");
+    let pivot_tables = wb.pivot_tables().unwrap();
+    let mut results = pivot_tables.get_pivot_tables_by_name_and_sheet();
+    results.sort();
+    let expected = vec![
+        ("PivotSheet1", "PivotTable1"),
+        ("PivotSheet2", "PivotTable2"),
+        ("PivotSheet3", "PivotTable1"),
+        ("PivotSheet4", "PivotTable5"),
+        ("PivotSheet4", "PivotTable6"),
+    ];
+    assert_eq!(expected, results);
+
+    let pivot_table_data_pt5: Vec<Vec<Data>> = wb
+        .pivot_table_data(&pivot_tables, "PivotSheet4", "PivotTable5")
+        .unwrap()
+        .map(|val| val.unwrap())
+        .collect();
+    for (sheet_name, pt_name) in pivot_tables.get_pivot_tables_by_name_and_sheet() {
+        if pt_name.eq("PivotTable5") {
+            continue;
+        }
+        let pivot_table_data_other: Vec<Vec<Data>> = wb
+            .pivot_table_data(&pivot_tables, sheet_name, pt_name)
+            .unwrap()
+            .map(|val| val.unwrap())
+            .collect();
+        assert_ne!(pivot_table_data_pt5, pivot_table_data_other);
+    }
+}
+
+#[test]
+fn test_pivot_cache_data_mapping() {
+    let mut wb: Xlsx<_> = wb("pivots.xlsx");
+    let expected = vec![
+        vec![
+            String("Id".to_string()),
+            String("Name".to_string()),
+            String("Category".to_string()),
+            String("Value".to_string()),
+            String("Size".to_string()),
+            String("Date".to_string()),
+            String("Value / Size".to_string()),
+            String("IsBlue".to_string()),
+            String("Null".to_string()),
+            String("Misc".to_string()),
+        ],
+        vec![
+            Int(1),
+            String("a".to_string()),
+            String("blue".to_string()),
+            Int(10),
+            Float(1.78),
+            DateTimeIso("2024-11-01T00:00:00".to_string()),
+            Float(5.617977528089887),
+            Bool(true),
+            Empty,
+            Empty,
+        ],
+        vec![
+            Int(2),
+            String("b".to_string()),
+            String("blue".to_string()),
+            Int(20),
+            Float(2.012),
+            DateTimeIso("2024-01-04T00:00:00".to_string()),
+            Float(9.940357852882704),
+            Bool(true),
+            Empty,
+            Float(2.012),
+        ],
+        vec![
+            Int(3),
+            String("c".to_string()),
+            String("blue".to_string()),
+            Int(15),
+            Float(3.121),
+            DateTimeIso("2024-01-31T00:00:00".to_string()),
+            Float(4.806151874399231),
+            Bool(true),
+            Empty,
+            DateTimeIso("2024-02-01T00:00:00".to_string()),
+        ],
+        vec![
+            Int(4),
+            String("d".to_string()),
+            String("blue".to_string()),
+            Int(20),
+            Float(1.052),
+            DateTimeIso("2024-01-21T00:00:00".to_string()),
+            Float(19.011406844106464),
+            Bool(true),
+            Empty,
+            Error(Ref),
+        ],
+        vec![
+            Int(5),
+            String("e".to_string()),
+            String("blue".to_string()),
+            Int(10),
+            Float(3.102),
+            DateTimeIso("2024-02-01T00:00:00".to_string()),
+            Float(3.2237266279819474),
+            Bool(true),
+            Empty,
+            Float(3.102),
+        ],
+        vec![
+            Int(6),
+            String("f".to_string()),
+            String("yellow".to_string()),
+            Int(5),
+            Float(1.02),
+            DateTimeIso("2024-01-01T00:00:00".to_string()),
+            Float(4.901960784313726),
+            Bool(false),
+            Empty,
+            Int(20),
+        ],
+        vec![
+            Int(7),
+            String("g".to_string()),
+            String("yellow".to_string()),
+            Int(10),
+            Int(0),
+            DateTimeIso("2024-01-11T00:00:00".to_string()),
+            Error(Ref),
+            Bool(false),
+            Empty,
+            Bool(true),
+        ],
+        vec![
+            Int(8),
+            String("h".to_string()),
+            String("yellow".to_string()),
+            Int(15),
+            Float(4.031),
+            DateTimeIso("1999-01-01T00:00:00".to_string()),
+            Float(3.721161002232697),
+            Bool(false),
+            Empty,
+            Int(5),
+        ],
+        vec![
+            Int(9),
+            String("i".to_string()),
+            String("yellow".to_string()),
+            Int(15),
+            Float(1.0421),
+            DateTimeIso("2024-12-01T00:00:00".to_string()),
+            Float(14.394012090970156),
+            Bool(false),
+            Empty,
+            Int(10),
+        ],
+        vec![
+            Int(10),
+            String("j".to_string()),
+            String("yellow".to_string()),
+            Int(5),
+            Float(1.20452),
+            DateTimeIso("2024-01-01T00:00:00".to_string()),
+            Float(4.151031116129246),
+            Bool(false),
+            Empty,
+            String("blue".to_string()),
+        ],
+    ];
+    let pivot_tables = wb.pivot_tables().unwrap();
+    let mut results = wb
+        .pivot_table_data(&pivot_tables, "PivotSheet1", "PivotTable1")
+        .unwrap();
+    for expected_data in expected {
+        assert_eq!(results.next().map(|m| m.unwrap()), Some(expected_data));
+    }
+}
+
+#[test]
+fn test_pivot_table_cache_match() {
+    let mut wb: Xlsx<_> = wb("pivots.xlsx");
+    let pivot_tables = wb.pivot_tables().unwrap();
+    let results1 = wb
+        .pivot_table_data(&pivot_tables, "PivotSheet1", "PivotTable1")
+        .unwrap()
+        .map(|val| val.unwrap())
+        .collect::<Vec<_>>();
+    let results2 = wb
+        .pivot_table_data(&pivot_tables, "PivotSheet2", "PivotTable2")
+        .unwrap()
+        .map(|val| val.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results1, results2);
+}
+
+#[test]
+fn vba_optional_records_581() {
+    // parsing missing-but-optional records should succeed
+    // ref: https://github.com/tafia/calamine/issues/581
+    let mut excel: Xls<_> = wb("optional_records.xls");
+    let vba = excel.vba_project().unwrap().unwrap();
+    let references = vba.get_references();
+    assert_eq!(
+        references,
+        [
+            Reference {
+                name: "stdole".to_string(),
+                description: "OLE Automation".to_string(),
+                path: "C:\\WINNT\\System32\\StdOle2.Tlb".into(),
+            },
+            Reference {
+                name: "MSForms".to_string(),
+                description: "Microsoft Forms 2.0 Object Library".to_string(),
+                path: "C:\\WINNT\\System32\\MSForms.TWD".into(),
+            },
+            Reference {
+                name: "Office".to_string(),
+                description: "Microsoft Office 8.0 Object Library".to_string(),
+                path: "C:\\Program Files\\Microsoft Office\\Office\\MSO97.DLL".into(),
+            },
+        ]
+    );
+    let module_names = vba.get_module_names();
+    assert_eq!(module_names, vec!["Sheet15"]);
+}
+
+#[test]
+fn biff5_defined_names_and_empty_sheets_612() {
+    // covers a parsing error where biff8 byte layout was assumed
+    // ref: https://github.com/tafia/calamine/issues/612
+    let excel: Xls<_> = wb("misc_biff5_parsing.xls");
+    assert_eq!(excel.sheet_names().len(), 11);
+    assert_eq!(
+        excel.defined_names(),
+        [("test".to_string(), "Sheet10!$L$17".to_string())]
+    );
+}
+
+#[test]
+fn test_capitalized_book_stream() {
+    // capitalized WORKBOOK and BOOK stream names are accepted by libreoffice
+    // ref: https://github.com/tafia/calamine/issues/618
+    let _wb: Xls<_> = wb("capitalized_wbook_stream.xls");
+}

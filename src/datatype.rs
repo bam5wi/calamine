@@ -6,8 +6,8 @@ use std::fmt;
 #[cfg(feature = "chrono")]
 use std::sync::OnceLock;
 
-use serde::de::Visitor;
 use serde::Deserialize;
+use serde::de::Visitor;
 
 use super::CellErrorType;
 
@@ -161,7 +161,7 @@ impl DataType for Data {
             Data::Int(v) => Some(*v),
             Data::Float(v) => Some(*v as i64),
             Data::Bool(v) => Some(*v as i64),
-            Data::String(v) => atoi_simd::parse::<i64>(v.as_bytes()).ok(),
+            Data::String(v) => atoi_simd::parse::<i64, false, false>(v.as_bytes()).ok(),
             _ => None,
         }
     }
@@ -473,8 +473,8 @@ impl DataType for DataRef<'_> {
             DataRef::Int(v) => Some(*v),
             DataRef::Float(v) => Some(*v as i64),
             DataRef::Bool(v) => Some(*v as i64),
-            DataRef::String(v) => atoi_simd::parse::<i64>(v.as_bytes()).ok(),
-            DataRef::SharedString(v) => atoi_simd::parse::<i64>(v.as_bytes()).ok(),
+            DataRef::String(v) => atoi_simd::parse::<i64, false, false>(v.as_bytes()).ok(),
+            DataRef::SharedString(v) => atoi_simd::parse::<i64, false, false>(v.as_bytes()).ok(),
             _ => None,
         }
     }
@@ -941,8 +941,14 @@ impl ExcelDateTime {
 
         // Get the time part of the Excel datetime.
         let time = excel_datetime.fract();
-        let milli = ((time * DAY_SECONDS).fract() * 1000.0).round() as u64;
-        let day_as_seconds = (time * DAY_SECONDS) as u64;
+        let mut milli = ((time * DAY_SECONDS).fract() * 1000.0).round() as u64;
+        let mut day_as_seconds = (time * DAY_SECONDS) as u64;
+
+        // Handle millisecond overflow due to rounding.
+        if milli == 1000 {
+            day_as_seconds += 1;
+            milli = 0;
+        }
 
         // Calculate the hours, minutes and seconds in the day.
         let hour = day_as_seconds / HOUR_SECONDS;
@@ -963,7 +969,7 @@ impl ExcelDateTime {
 
     // Check if a year is a leap year.
     fn is_leap_year(year: u64) -> bool {
-        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
     }
 }
 
@@ -1097,6 +1103,7 @@ mod tests {
         #[allow(clippy::excessive_precision)]
         let test_data = vec![
             (0.0, (1899, 12, 31, 0, 0, 0, 0)),
+            (0.99998842592, (1899, 12, 31, 23, 59, 59, 0)),
             (30188.010650613425, (1982, 8, 25, 0, 15, 20, 213)),
             (60376.011670023145, (2065, 4, 19, 0, 16, 48, 290)),
             (90565.038488958337, (2147, 12, 15, 0, 55, 25, 446)),
